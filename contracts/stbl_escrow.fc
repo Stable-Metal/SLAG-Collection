@@ -1,0 +1,97 @@
+;; Staking Escrow Smart Contract
+
+#pragma version ^0.4.0;
+
+#include "imports/stdlib.fc";
+#include "imports/delib.fc";
+#include "utils/consts.fc";
+#include "utils/context.fc";
+
+global slice self::main_address;  ;; stbl_staking contract
+global slice self::staker_address;
+global cell  self::stored_data;
+
+() load_data() impure inline {
+    slice data = get_data().begin_parse();
+
+    self::main_address      = data~load_msg_addr();
+    self::staker_address    = data~load_msg_addr();
+    self::stored_data       = data~load_ref();
+}
+
+() save_data() impure inline {
+    builder data = begin_cell()
+        .store_slice(self::main_address)
+        .store_slice(self::staker_address)
+        .store_ref(self::stored_data);
+
+    set_data(data.end_cell());
+}
+
+;; stores response for the stake and unstake callback
+() store_ext_data(slice msg_body) impure inline {
+    ;; fwd_op = callback::escrow::end_stake_or_unstake_op
+    int fwd_op = msg_body~load_uint(32);
+    self::stored_data = msg_body~load_ref();
+
+    ;; constructing message to main 
+    builder body = begin_cell()
+        .store_uint(fwd_op, 32)
+        .store_uint(msg::query_id, 64)
+        .store_slice(self::staker_address)
+        .store_slice(msg_body);  ;; only fwd_payload (=slice with staker addr) left in the body 
+
+    ;; sending message to main
+    cell msg = delib::int_msg(msg::sender, false, 0, body.end_cell(), null());
+    send_raw_message(msg, MSG::ALL_NOT_RESERVED);
+}
+
+() get_escrow_data(slice msg_body) impure inline {
+    ;; fwd_op = callback::escrow::stake  || callback::escrow::unstake 
+    int fwd_op = msg_body~load_uint(32); ;; modifying method
+
+    builder body = begin_cell()
+        .store_uint(fwd_op, 32)
+        .store_uint(msg::query_id, 64)
+        .store_slice(self::staker_address)
+        .store_ref(self::stored_data)  ;; sends store data (current escrow status)
+        .store_slice(msg_body); ;; only amount in coins left in the message if stake
+        ;; amount in coins + transfer fee in coins if unstake
+
+    cell msg = delib::int_msg(msg::sender, false, 0, body.end_cell(), null());
+    send_raw_message(msg, MSG::ALL_NOT_RESERVED);
+}
+
+;; function selector by msg::op
+() callselector(slice msg_body) impure inline_ref {
+    throw_if(0, msg::op == 0 | msg::bounced?); ;; ignore simple transfers or bounced
+
+    load_data();
+    ;; only Main Staking contract can send messages
+    throw_unless(ERR::ACCESS, equal_slice_bits(msg::sender, self::main_address)); 
+
+    ;; receive after jettonA stake or unstake request
+    if (msg::op == op::escrow::get_escrow_data) { return get_escrow_data(msg_body); }
+    ;; store response from the stake callback
+    if (msg::op == op::escrow::store_execution_data) { return store_ext_data(msg_body); }
+    
+
+    throw(0xffff); ;; not found
+}
+
+;; internal message entry point
+() recv_internal(int balance, int value, cell msg, slice msg_body) impure {
+    throw_if(0, msg_body.slice_empty?() | msg_body.slice_bits() < 32 + 64);
+
+    msg_body~ctx::load(msg, balance, value);
+    delib::force_addr(msg::sender, CONF::WC, false, ERR::ADDR_FORMAT);
+
+    ctx::reserve(ESCROW::TARGET);
+    callselector(msg_body);
+    save_data();
+}
+
+(slice, slice, cell) get_stored_data() method_id {
+    load_data();
+    return (self::main_address, self::staker_address, self::stored_data);
+}
